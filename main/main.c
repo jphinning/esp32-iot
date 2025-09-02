@@ -1,4 +1,3 @@
-// main.c
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -6,7 +5,6 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
-#include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
@@ -15,15 +13,17 @@
 #include "driver/gpio.h"
 #include "lwip/inet.h"
 #include <lwip/sockets.h>
+#include "lib/wifi.h"
+#include "lib/dht11.h"
 
-static const char *TAG = "simple_http_led";
-
-/* ----- USER CONFIG: change these ----- */
-#define WIFI_SSID "Jph"
-#define WIFI_PASS "rntdmf83"
-/* ------------------------------------ */
+static const char *TAG = "http_server";
+static const char *TAG1 = "dht11_sensor";
 
 #define LED_GPIO GPIO_NUM_2
+
+//DHT11 task definitions
+#define CONFIG_DHT11_PIN GPIO_NUM_4
+#define CONFIG_CONNECTION_TIMEOUT 5
 
 /* Default blink times (ms) */
 static uint32_t time_on_ms  = 500;
@@ -31,8 +31,12 @@ static uint32_t time_off_ms = 500;
 
 static uint32_t counter = 0;
 
+static float temperature = 0.0;
+static float humidity = 0.0;
+
 /* Protect access to time_on_ms / time_off_ms */
 static SemaphoreHandle_t time_mutex;
+static SemaphoreHandle_t dht11_mutex;
 
 /* Forward declarations */
 static esp_err_t index_get_handler(httpd_req_t *req);
@@ -40,10 +44,10 @@ static esp_err_t set_time_post_handler(httpd_req_t *req);
 static esp_err_t gauge_counter_get_handler(httpd_req_t *req);
 static esp_err_t counter_get_handler(httpd_req_t *req);
 static void led_task(void *arg);
-static void wifi_init_sta(void);
+static esp_err_t api_dados_get_handler(httpd_req_t *req);
 
 /* HTML form for GET "/" */
-static const char index_html[] =
+static const char *index_html =
   "<!doctype html>"
   "<html><head><meta charset='utf-8' http-equiv='refresh' content='2'><title>LED timer</title></head>"
   "<body>"
@@ -119,6 +123,15 @@ static void get_times(uint32_t *on, uint32_t *off, uint32_t *ctr)
     xSemaphoreGive(time_mutex);
 }
 
+static void get_dht11(float *temp, float *hum)
+{
+    if (!dht11_mutex) { *temp = temperature; *hum = humidity; return; }
+    xSemaphoreTake(dht11_mutex, portMAX_DELAY);
+    *temp = temperature;
+    *hum = humidity;
+    xSemaphoreGive(dht11_mutex);
+}
+
 /* Utility: set times (thread-safe) */
 static void set_times(uint32_t on, uint32_t off)
 {
@@ -129,10 +142,19 @@ static void set_times(uint32_t on, uint32_t off)
     xSemaphoreGive(time_mutex);
 }
 
+static void set_dht11(float temp, float hum)
+{
+    if (!dht11_mutex) { temperature = temp; humidity = hum; return; }
+    xSemaphoreTake(dht11_mutex, portMAX_DELAY);
+    temperature = temp;
+    humidity = hum;
+    xSemaphoreGive(dht11_mutex);
+}
+
 static void increment_counter(void)
 {
     xSemaphoreTake(time_mutex, portMAX_DELAY);
-    if(counter == 100){
+    if(counter >= 100){
         counter = 0;
     }
     else{   
@@ -266,6 +288,26 @@ static esp_err_t counter_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t api_dados_get_handler(httpd_req_t *req)
+{
+    char json_buffer[128];
+    uint32_t on, off, ctr;
+    float temp, hum;
+
+    get_dht11(&temp, &hum);
+
+    get_times(&on, &off, &ctr);
+
+    snprintf(json_buffer, sizeof(json_buffer),
+             "{\"temperatura\":\"%f\",\"umidade\":\"%f\",\"contador\":\"%u\"}",
+             temp, hum, (unsigned)ctr);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_buffer, HTTPD_RESP_USE_STRLEN);
+
+    return ESP_OK;
+}
+
 /* Register URIs and start http server */
 static httpd_handle_t start_webserver(void)
 {
@@ -309,6 +351,14 @@ static httpd_handle_t start_webserver(void)
         .user_ctx  = NULL
     };
     httpd_register_uri_handler(server, &counter_uri);
+
+    httpd_uri_t json_uri = {
+        .uri       ="/api/dados",
+        .method    = HTTP_GET,
+        .handler   = api_dados_get_handler,
+        .user_ctx  = NULL
+    };
+    httpd_register_uri_handler(server, &json_uri);
 
     ESP_LOGI(TAG, "HTTP server started");
     return server;
@@ -354,79 +404,40 @@ static void counter_task(void *arg)
     }
 }
 
-/* ---------- WiFi event handlers ---------- */
+static void dht11_task(void *arg){
+    dht11_t dht11_sensor;
+    dht11_sensor.dht11_pin = CONFIG_DHT11_PIN;
 
-static void on_wifi_event(void* arg, esp_event_base_t event_base,
-                          int32_t event_id, void* event_data)
-{
-    if (event_base == WIFI_EVENT) {
-        if (event_id == WIFI_EVENT_STA_START) {
-            esp_wifi_connect();
-        } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
-            ESP_LOGW(TAG, "Disconnected. Reconnecting...");
-            esp_wifi_connect();
-        }
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t*) event_data;
-        char ipstr[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &event->ip_info.ip, ipstr, sizeof(ipstr));
-        ESP_LOGI(TAG, "Got IP: %s", ipstr);
-    }
-}
+    // Read data
+    while(1)
+    {
+      if(!dht11_read(&dht11_sensor, CONFIG_CONNECTION_TIMEOUT))
+      {  
+        ESP_LOGI(TAG1, "[Temperature]> %.2f \n",dht11_sensor.temperature);
+        ESP_LOGI(TAG1, "[Humidity]> %.2f \n",dht11_sensor.humidity);
 
-static void wifi_init_sta(void)
-{
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    /* Register handlers for WiFi and IP events */
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &on_wifi_event,
-                                                        NULL,
-                                                        NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &on_wifi_event,
-                                                        NULL,
-                                                        NULL));
-
-    wifi_config_t wifi_config = { 0 };
-    strncpy((char*)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid)-1);
-    strncpy((char*)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password)-1);
-
-    ESP_LOGI(TAG, "Setting WiFi SSID %s", WIFI_SSID);
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+        set_dht11(dht11_sensor.temperature, dht11_sensor.humidity);
+      }
+      vTaskDelay(2000/portTICK_PERIOD_MS);
+    } 
 }
 
 /* ---------- app_main ---------- */
 void app_main(void)
 {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
     time_mutex = xSemaphoreCreateMutex();
-    if (!time_mutex) {
+    dht11_mutex = xSemaphoreCreateMutex();
+    if (!time_mutex || !dht11_mutex) {
         ESP_LOGE(TAG, "Failed to create mutex");
         return;
     }
 
-    ESP_LOGI(TAG, "Initializing WiFi...");
-    wifi_init_sta();
+    connect_to_wifi(); 
 
     /* Start LED task */
     xTaskCreatePinnedToCore(counter_task, "counter_task", 2048, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(led_task, "led_task", 2048, NULL, tskIDLE_PRIORITY + 1, NULL, tskNO_AFFINITY);
+    xTaskCreatePinnedToCore(dht11_task, "dht11_task", 2048, NULL, 1, NULL, 1);
 
     /* Start HTTP server (runs in its own task(s)) */
     start_webserver();

@@ -1,2 +1,4 @@
-idf_component_register(SRCS "main.c"
-                    INCLUDE_DIRS ".")
+file(GLOB SRCS "*.c" "lib/*.c")
+
+idf_component_register(SRCS ${SRCS}
+                    INCLUDE_DIRS "." "lib")
